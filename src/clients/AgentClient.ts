@@ -4,10 +4,9 @@ import { ethers, Wallet } from 'ethers';
 import WebSocket from 'ws';
 import { WsMessageTypes } from '../types/ws.ts';
 import { agentMessageInputSchema, gmMessageInputSchema, observationMessageInputSchema } from '../types/schemas.ts';
-import { sortObjectKeys } from './sortObjectKeys.ts';
 import { SharedWebSocket, WebSocketConfig } from './shared-websocket.ts';
-import { ExtendedAgentRuntime } from '../types/index.ts';
 import { MessageHistoryEntry } from './types.ts';
+import { signMessage, createMessageContent } from './signMessage.ts';
 
 interface RoundResponse { // for get active rounds
   success: boolean;
@@ -97,14 +96,13 @@ export class AgentClient extends DirectClient {
     }
 
     const timestamp = Date.now();
-    const authContent = sortObjectKeys({
+    const authContent = createMessageContent.auth({
       walletAddress: this.wallet.address,
       agentId: this.agentNumericId,
-      roomId: this.roomId,
-      timestamp
+      roomId: this.roomId
     });
     
-    const signature = await this.wallet.signMessage(JSON.stringify(authContent));
+    const signature = await signMessage(authContent, this.wallet.privateKey);
 
     // Create new WebSocket connection with updated config
     const wsConfig: WebSocketConfig = {
@@ -209,38 +207,30 @@ export class AgentClient extends DirectClient {
     return summaries[id] || '';
   }
 
-  public async sendAIMessage(content: { text: string }): Promise<void> {
+  public async sendAIMessage(content: { text: string; [key: string]: any }): Promise<void> {
     if (!this.roomId || !this.roundId) {
-      throw new Error('Agent not initialized with room and round IDs');
+        throw new Error('Agent not initialized with room and round IDs');
     }
 
     try {
-        // Create base message content
-        const messageContent = {
-            agentId: this.agentNumericId,
-            context: [], // Add empty context array
-            roomId: this.roomId,
-            roundId: this.roundId,
-            text: content.text,
-            timestamp: Date.now()
-        };
-
-        // Sort the entire message object structure
-        const sortedContent = sortObjectKeys(messageContent);
-        
-        // Generate signature from sorted content
-        const signature = await this.generateSignature(sortedContent);
-
-        // Construct final message and sort it
-        const message = sortObjectKeys({
-            content: sortedContent,
-            messageType: WsMessageTypes.AGENT_MESSAGE,
-            signature,
-            sender: this.walletAddress
+        const messageContent = createMessageContent.agent({
+          roomId: this.roomId,
+          roundId: this.roundId,
+          agentId: this.agentNumericId,
+          text: content.text
         });
 
-        // Send message
-        await axios.post(
+        const signature = await signMessage(messageContent, this.wallet.privateKey);
+
+        const message = {
+            messageType: WsMessageTypes.AGENT_MESSAGE,
+            content: messageContent,
+            signature,
+            sender: this.walletAddress
+        };
+
+        // Send and handle response
+        const response = await axios.post(
             `${this.endpoint}/messages/agentMessage`,
             message,
             {
@@ -250,20 +240,40 @@ export class AgentClient extends DirectClient {
             }
         );
 
+        if (response.status !== 200) {
+            console.error('Server responded with error:', response.data);
+            if (response.data?.error) {
+                console.error('Server error details:', response.data.error);
+            }
+        }
+
     } catch (error) {
         console.error('Error sending agent message:', error);
+        if (axios.isAxiosError(error) && error.response?.data) {
+            console.error('Server error response:', error.response.data);
+            console.error('Failed message:', JSON.stringify(content, null, 2));
+        }
         throw error;
     }
 }
+
+
 
   public getAgentId(): number {
     return this.agentNumericId;
   }
 
   private async generateSignature(content: any): Promise<string> {
-    // Sign the stringified sorted content
-    const messageString = JSON.stringify(sortObjectKeys(content));
-    console.log('Agent signing message:', messageString);
+    // Create object with fixed field order
+    const signedContent = {
+      timestamp: content.timestamp,     // Must be first
+      roomId: content.roomId,          // Must be second
+      roundId: content.roundId,        // Must be third
+      agentId: content.agentId,        // Must be fourth
+      text: content.text               // Must be fifth
+    };
+    const messageString = JSON.stringify(signedContent);
+    console.log('Signing message:', messageString);
     return await this.wallet.signMessage(messageString);
 }
 
@@ -282,7 +292,27 @@ export class AgentClient extends DirectClient {
 
   private async handleAgentMessage(message: any): Promise<void> {
     try {
-      const validatedMessage = agentMessageInputSchema.parse(message);
+      // Log incoming message for debugging
+      console.log('Received agent message:', JSON.stringify(message, null, 2));
+      
+      // Ensure message has the required structure before validation
+      const formattedMessage = {
+        messageType: WsMessageTypes.AGENT_MESSAGE,
+        signature: message.signature || '',
+        sender: message.sender || '',
+        content: {
+          agentId: message.content?.agentId || 0,
+          text: message.content?.text || '',
+          // Add required fields from schema
+          timestamp: Date.now(),
+          roomId: this.roomId,
+          roundId: this.roundId
+        }
+      };
+
+      // Validate with schema
+      const validatedMessage = agentMessageInputSchema.parse(formattedMessage);
+
       // Only respond to messages from other agents
       if (validatedMessage.content.agentId !== this.agentNumericId) {
         const response = await this.processMessage(validatedMessage.content.text);
@@ -292,6 +322,8 @@ export class AgentClient extends DirectClient {
       }
     } catch (error) {
       console.error('Error handling agent message:', error);
+      // Log the original message for debugging
+      console.error('Original message:', message);
     }
   }
 
@@ -492,20 +524,15 @@ Your response to the current topic: ${text}
           break;
 
         case WsMessageTypes.HEARTBEAT:
-          // Send signed heartbeat response
-          const heartbeatContent = sortObjectKeys({
-              timestamp: Date.now()
-          });
+          const heartbeatContent = createMessageContent.heartbeat();
           
-          const signature = await this.wallet.signMessage(
-              JSON.stringify(heartbeatContent)
-          );
+          const signature = await signMessage(heartbeatContent, this.wallet.privateKey);
           
-          this.wsClient.send({
-              messageType: WsMessageTypes.HEARTBEAT,
-              content: heartbeatContent,
-              signature,
-              sender: this.walletAddress
+          this.wsClient?.send({
+            messageType: WsMessageTypes.HEARTBEAT,
+            content: heartbeatContent,
+            signature,
+            sender: this.walletAddress
           });
           break;
       }

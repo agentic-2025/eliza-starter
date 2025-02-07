@@ -7,6 +7,7 @@ import { gmMessageInputSchema } from '../types/schemas.ts';
 import { WsMessageTypes } from '../types/ws.ts';
 import { sortObjectKeys } from './sortObjectKeys.ts';
 import { SharedWebSocket, WebSocketConfig } from './shared-websocket.ts';
+import { createMessageContent, signMessage } from './signMessage.ts';
 
 interface RoundResponse { // for get active rounds
   success: boolean;
@@ -61,16 +62,16 @@ export class GameMasterClient extends DirectClient {
   }
 
   private async generateSignature(content: any): Promise<string> {
-    // Create message object with exact field order using sortObjectKeys
-    const messageObj = sortObjectKeys({
-        gmId: this.gmNumericId,
-        ignoreErrors: false,
-        message: content.message,
-        roomId: content.roomId,
-        roundId: content.roundId,
-        targets: content.targets,
-        timestamp: content.timestamp
-    });
+    // Create message object with exact field order to match verifySignature.ts
+    const messageObj = {
+        timestamp: content.timestamp,      // Must be first
+        roomId: content.roomId,           // Must be second
+        roundId: content.roundId,         // Must be third
+        gmId: this.gmNumericId,          // Must be fourth (analogous to agentId)
+        message: content.message,         // Must be fifth (analogous to text)
+        targets: content.targets,         // Additional GM-specific fields after core fields
+        ignoreErrors: false
+    };
 
     const messageString = JSON.stringify(messageObj);
     console.log('GM signing message:', messageString);
@@ -96,14 +97,13 @@ export class GameMasterClient extends DirectClient {
 
     // Initialize WS with proper auth
     const timestamp = Date.now();
-    const authContent = sortObjectKeys({
+    const authContent = createMessageContent.auth({
       walletAddress: this.wallet.address,
       agentId: this.gmNumericId,
-      roomId: this.roomId,
-      timestamp
+      roomId: this.roomId
     });
     
-    const signature = await this.wallet.signMessage(JSON.stringify(authContent));
+    const signature = await signMessage(authContent, this.wallet.privateKey);
 
     const wsConfig: WebSocketConfig = {
       endpoint: this.endpoint,
@@ -131,15 +131,14 @@ export class GameMasterClient extends DirectClient {
     await this.wsClient.connect();
 
     // Subscribe to room
-    const subscribeContent = sortObjectKeys({
-      roomId: this.roomId,
-      timestamp: Date.now()
+    const subscribeContent = createMessageContent.subscribe({
+      roomId: this.roomId
     });
 
     const subscribeMessage = {
       messageType: WsMessageTypes.SUBSCRIBE_ROOM,
       content: subscribeContent,
-      signature: await this.wallet.signMessage(JSON.stringify(subscribeContent)),
+      signature: await signMessage(subscribeContent, this.wallet.privateKey),
       sender: this.wallet.address
     };
 
@@ -177,18 +176,16 @@ export class GameMasterClient extends DirectClient {
       throw new Error('GameMaster not initialized with room/round');
     }
 
-    const content = sortObjectKeys({
-      gmId: this.gmNumericId,
-      timestamp: Date.now(),
+    const content = createMessageContent.gm({
       roomId: this.roomId,
       roundId: this.roundId,
+      gmId: this.gmNumericId,
       message: text,
       targets,
       ignoreErrors: false
     });
 
-    const messageString = JSON.stringify(content);
-    const signature = await this.wallet.signMessage(messageString);
+    const signature = await signMessage(content, this.wallet.privateKey);
 
     const message = gmMessageInputSchema.parse({
       messageType: WsMessageTypes.GM_MESSAGE,
@@ -334,10 +331,7 @@ export class GameMasterClient extends DirectClient {
       
       switch (message.messageType) {
         case WsMessageTypes.HEARTBEAT:
-          // Respond to heartbeat with signed message
-          const heartbeatContent = sortObjectKeys({
-            timestamp: Date.now()
-          });
+          const heartbeatContent = createMessageContent.heartbeat();
           
           this.wallet.signMessage(JSON.stringify(heartbeatContent))
             .then(signature => {

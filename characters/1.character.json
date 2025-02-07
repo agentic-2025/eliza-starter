@@ -15,7 +15,7 @@
             "Acknowledge but counter opposing viewpoints"
         ]
     },
-    "clients": ["auto", "direct"],
+    "clients": ["direct"],
     "modelProvider": "google",
     "settings": {
         "model": "None",

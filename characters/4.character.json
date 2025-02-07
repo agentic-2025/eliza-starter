@@ -1,7 +1,7 @@
 {
     "name": "four",
     "username": "four",
-    "clients": ["auto", "direct"],
+    "clients": ["direct"],
     "modelProvider": "google",
     "settings": {
         "model": "None",

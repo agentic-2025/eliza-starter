@@ -1,7 +1,8 @@
-import { stringToUuid, type UUID } from '@elizaos/core';
+import { stringToUuid, type UUID, elizaLogger } from '@elizaos/core';
 import type { ExtendedAgentRuntime } from './types/index.ts';
 import { WsMessageTypes } from './types/ws.ts';
 import { GameMasterClient } from './clients/GameMasterClient.ts';
+import { PVPVAIIntegration } from './clients/PVPVAIIntegration.ts';
 
 interface DebateState {
   phase: 'init' | 'discussion' | 'voting' | 'end';
@@ -19,6 +20,55 @@ class DebateOrchestrator {
   private currentTopicId: UUID;
   private roomId?: number;
   private roundId?: number;
+  private isRunning: boolean = false;
+  private currentSpeakerIndex: number = 0;
+
+  // Update timing configuration with safer delays
+  private readonly config = {
+    minResponseDelay: 15000,    // Minimum delay between responses (15s)
+    maxResponseDelay: 20000,    // Maximum delay between responses (20s)
+    turnDelay: 5000,           // Delay between turns (5s)
+    gmThinkingTime: 10000,     // Time for GM to "think" (10s)
+    roundBreak: 30000,         // Break between rounds (30s)
+    retryDelay: 10000,         // Delay before retrying failed API calls (10s)
+    maxRetries: 3              // Maximum number of retries for failed calls
+  };
+
+  // Add rate limiting queue
+  private lastApiCall: number = 0;
+  private readonly MIN_API_INTERVAL = 10000; // Minimum 10s between API calls
+
+  private async waitForRateLimit(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastCall = now - this.lastApiCall;
+    
+    if (timeSinceLastCall < this.MIN_API_INTERVAL) {
+      const waitTime = this.MIN_API_INTERVAL - timeSinceLastCall;
+      await this.sleep(waitTime);
+    }
+    this.lastApiCall = Date.now();
+  }
+
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>, 
+    retries: number = this.config.maxRetries
+  ): Promise<T> {
+    for (let i = 0; i < retries; i++) {
+      try {
+        await this.waitForRateLimit();
+        return await operation();
+      } catch (error: any) {
+        if (error?.statusCode === 429 && i < retries - 1) {
+          const delay = this.config.retryDelay * Math.pow(2, i);
+          console.log(`Rate limited, waiting ${delay}ms before retry ${i + 1}/${retries}`);
+          await this.sleep(delay);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error('Max retries exceeded');
+  }
 
   private state: DebateState = {
     phase: 'init',
@@ -29,19 +79,38 @@ class DebateOrchestrator {
     this.currentTopicId = stringToUuid('debate-topic') as UUID;
     
     // Separate GM from regular agents
-    runtimes.forEach(runtime => {
-      const character = runtime.character as any;
-      if (character.agentRole?.type === 'GM') {
+    for (const runtime of runtimes) {
+      if (runtime.character.agentRole?.type.toUpperCase() === 'GM') {
         this.gameMaster = runtime;
       } else {
         this.agents.push(runtime);
       }
-    });
+    }
+
+    if (!this.gameMaster) {
+      throw new Error('No GM found in provided runtimes');
+    }
 
     console.log('DebateOrchestrator initialized with:', {
-      gameMaster: this.gameMaster?.character?.name,
-      agents: this.agents.map(a => a.character?.name)
+      gameMaster: this.gameMaster.character.name,
+      agents: this.agents.map(a => a.character.name)
     });
+  }
+
+  private getDebateAgents(): ExtendedAgentRuntime[] {
+    return this.agents;
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private getRandomDelay(): number {
+    return Math.floor(
+      Math.random() * 
+      (this.config.maxResponseDelay - this.config.minResponseDelay) + 
+      this.config.minResponseDelay
+    );
   }
 
   public async initialize(roomId: number): Promise<void> {
@@ -76,6 +145,45 @@ class DebateOrchestrator {
     console.log(`DebateOrchestrator initialized with room ${this.roomId} and round ${this.roundId}`);
   }
 
+  private async handleGMTurn(gmRuntime: ExtendedAgentRuntime): Promise<void> {
+    const client = gmRuntime.clients['pvpvai'] as PVPVAIIntegration;
+    if (!client) return;
+
+    await this.sleep(this.config.gmThinkingTime);
+    
+    // Use retryWithBackoff for API calls
+    await this.retryWithBackoff(async () => {
+      const messages = [
+        "Let's explore this topic further. What are your thoughts on scalability?",
+        "Interesting perspectives. How do you address security concerns?",
+        "Let's focus on real-world applications. Can you provide specific examples?",
+        "What are your views on interoperability between different chains?",
+        "How does your approach handle network congestion?",
+        "Let's discuss environmental impact and sustainability.",
+        "What about developer experience and ecosystem growth?",
+        "How do you ensure decentralization while maintaining performance?"
+      ];
+
+      const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+      await client.sendAIMessage(randomMessage);
+    });
+  }
+
+  private async handleAgentTurn(runtime: ExtendedAgentRuntime): Promise<void> {
+    const client = runtime.clients['pvpvai'] as PVPVAIIntegration;
+    if (!client) return;
+
+    await this.sleep(this.getRandomDelay());
+    
+    // Use retryWithBackoff for API calls
+    await this.retryWithBackoff(async () => {
+      const response = await client.processMessage("Continue the debate based on the previous messages.");
+      if (response) {
+        await client.sendAIMessage(response);
+      }
+    });
+  }
+
   public async startDebate() {
     try {
         // Add log to help debug
@@ -105,6 +213,37 @@ class DebateOrchestrator {
         await gmClient.sendGMMessage(topic, validAgentIds);
         
         this.state.phase = 'discussion';
+
+        this.isRunning = true;
+        if (!this.gameMaster) {
+          throw new Error("No GM found in runtimes");
+        }
+
+        elizaLogger.log("Starting debate with turn-based system...");
+
+        while (this.isRunning) {
+          try {
+            // GM's turn with rate limiting
+            await this.handleGMTurn(this.gameMaster);
+            await this.sleep(this.config.turnDelay);
+
+            // Agents take turns responding with rate limiting
+            for (let i = 0; i < this.agents.length && this.isRunning; i++) {
+              const runtime = this.agents[i];
+              elizaLogger.log(`${runtime.character.name}'s turn...`);
+              
+              await this.handleAgentTurn(runtime);
+              await this.sleep(this.config.turnDelay);
+            }
+
+            // Longer break between rounds to help with rate limiting
+            await this.sleep(this.config.roundBreak);
+
+          } catch (error) {
+            elizaLogger.error("Error in debate loop:", error);
+            await this.sleep(this.config.retryDelay); // Prevent rapid error loops
+          }
+        }
 
     } catch (error) {
         console.error('Error in startDebate:', error);
@@ -147,6 +286,17 @@ class DebateOrchestrator {
     if (gmClient) {
       gmClient.sendGMMessage("Debate session ended.", [])
         .catch(error => console.error('Error sending debate end message:', error));
+    }
+
+    elizaLogger.log("Stopping debate...");
+    this.isRunning = false;
+    
+    // Cleanup
+    for (const runtime of this.agents) {
+      const client = runtime.clients['pvpvai'] as PVPVAIIntegration;
+      if (client) {
+        client.close();
+      }
     }
   }
 }

@@ -27,15 +27,24 @@ export class SharedWebSocket {
   private reconnectAttempts = 0;
   private isActive = true;
   private lastHeartbeatResponse = Date.now();
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private readonly MAX_RECONNECT_DELAY = 30000; // 30 seconds max
+  private reconnectAttempt = 0;
 
   constructor(private config: WebSocketConfig) {}
 
   public async connect(): Promise<void> {
-    if (this.ws?.readyState === WebSocket.OPEN) return;
-    
+    // Clear any existing connection
     if (this.ws) {
+      this.ws.removeAllListeners();
       this.ws.close();
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      this.ws = null;
+    }
+
+    // Clear any pending reconnect
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
 
     const wsUrl = new URL(this.config.endpoint);
@@ -53,37 +62,54 @@ export class SharedWebSocket {
     }
     wsUrl.search = params.toString();
 
-    this.ws = new WebSocket(wsUrl.toString());
-
     return new Promise((resolve, reject) => {
-      if (!this.ws) return reject('WebSocket not initialized');
+      try {
+        this.ws = new WebSocket(wsUrl.toString());
 
-      const connectionTimeout = setTimeout(() => {
-        if (this.ws?.readyState !== WebSocket.OPEN) {
-          this.ws?.close();
-          reject(new Error('WebSocket connection timeout'));
-        }
-      }, 10000);
+        this.ws.on('open', async () => {
+          console.log('WebSocket connected');
+          this.reconnectAttempt = 0; // Reset counter on successful connection
+          try {
+            await this.subscribeToRoom();
+            this.setupHeartbeat();
+            this.reconnectAttempts = 0;
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
 
-      this.ws.on('open', async () => {
-        clearTimeout(connectionTimeout);
-        try {
-          await this.subscribeToRoom();
-          this.setupHeartbeat();
-          this.reconnectAttempts = 0;
-          resolve();
-        } catch (error) {
+        this.ws.on('message', (data) => {
+          try {
+            this.handleMessage(data);
+          } catch (err) {
+            console.error('Error handling message:', err);
+          }
+        });
+
+        this.ws.on('error', (error) => {
+          console.error('WebSocket error:', error);
+          this.config.handlers.onError?.(error as Error);
           reject(error);
-        }
-      });
+        });
 
-      this.ws.on('message', (data) => this.handleMessage(data));
-      this.ws.on('close', () => this.handleDisconnect());
-      this.ws.on('error', (error) => {
-        clearTimeout(connectionTimeout);
-        this.config.handlers.onError?.(error as Error);
+        this.ws.on('close', () => {
+          this.handleDisconnect();
+        });
+
+        // Add connection timeout
+        const timeout = setTimeout(() => {
+          if (this.ws?.readyState !== WebSocket.OPEN) {
+            this.ws?.close();
+            reject(new Error('WebSocket connection timeout'));
+          }
+        }, 5000);
+
+        this.ws.once('open', () => clearTimeout(timeout));
+
+      } catch (error) {
         reject(error);
-      });
+      }
     });
   }
 
@@ -152,17 +178,17 @@ export class SharedWebSocket {
     
     if (!this.isActive) return;
 
-    const backoff = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-    this.reconnectAttempts++;
+    const delay = Math.min(
+      1000 * Math.pow(2, this.reconnectAttempt),
+      this.MAX_RECONNECT_DELAY
+    );
     
-    setTimeout(() => {
-      if (this.isActive) {
-        this.connect().catch(error => {
-          console.error('Reconnect failed:', error);
-          this.config.handlers.onError?.(error);
-        });
-      }
-    }, backoff);
+    console.log(`WebSocket disconnected. Attempting reconnect in ${delay}ms`);
+    
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectAttempt++;
+      this.connect().catch(console.error);
+    }, delay);
 
     this.config.handlers.onClose?.();
   }
@@ -186,4 +212,6 @@ export class SharedWebSocket {
   public isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }
+
+  
 }

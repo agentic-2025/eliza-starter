@@ -22,7 +22,7 @@ export const signMessage = async (content: SignableMessage, privateKey: string):
 
     // Create deterministic string representation
     const messageString = JSON.stringify(orderedContent);
-    console.log('Signing message string:', messageString);
+    // console.log('Signing message string:', messageString); // Debug
 
     // Sign the message
     const wallet = new Wallet(privateKey);

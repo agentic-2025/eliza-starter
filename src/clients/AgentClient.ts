@@ -7,6 +7,8 @@ import { agentMessageInputSchema, gmMessageInputSchema, observationMessageInputS
 import { SharedWebSocket, WebSocketConfig } from './shared-websocket.ts';
 import { MessageHistoryEntry } from './types.ts';
 import { signMessage, createMessageContent } from './signMessage.ts';
+import { PVPVAIIntegration } from './PVPVAIIntegration.ts';
+
 
 interface RoundResponse { // for get active rounds
   success: boolean;
@@ -28,6 +30,8 @@ export class AgentClient extends DirectClient {
   private readonly endpoint: string;
   private wsClient: SharedWebSocket; // Change from readonly to mutable
   private isActive = true;
+  private integration: PVPVAIIntegration;
+
 
   // Add PvP status tracking
   private activePvPEffects: Map<string, any> = new Map();
@@ -36,16 +40,23 @@ export class AgentClient extends DirectClient {
   private messageContext: MessageHistoryEntry[] = [];
   private readonly MAX_CONTEXT_SIZE = 8;
 
+  // Add message tracking at class level
+  private processedMessages = new Set<string>();
+
   constructor(
     endpoint: string,
     walletAddress: string,
     agentNumericId: number,
-    port: number
+    port: number,
+    integration: PVPVAIIntegration
+
   ) {
     super();
     this.endpoint = endpoint;
     this.walletAddress = walletAddress;
     this.agentNumericId = agentNumericId;
+    this.integration = integration;  // Store the integration instance
+
 
     // Get agent's private key from environment
     const privateKey = process.env[`AGENT_${agentNumericId}_PRIVATE_KEY`];
@@ -213,6 +224,9 @@ export class AgentClient extends DirectClient {
     }
 
     try {
+        // Use current timestamp for message metadata, not content
+        const timestamp = Date.now();
+        
         const messageContent = createMessageContent.agent({
           roomId: this.roomId,
           roundId: this.roundId,
@@ -226,24 +240,36 @@ export class AgentClient extends DirectClient {
             messageType: WsMessageTypes.AGENT_MESSAGE,
             content: messageContent,
             signature,
-            sender: this.walletAddress
+            sender: this.walletAddress,
+            timestamp // Add timestamp only to message metadata
         };
 
-        // Send and handle response
-        const response = await axios.post(
-            `${this.endpoint}/messages/agentMessage`,
-            message,
-            {
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            }
-        );
+        // Add retry logic for API calls
+        let retries = 0;
+        const maxRetries = 3;
+        
+        while (retries < maxRetries) {
+            try {
+                const response = await axios.post(
+                    `${this.endpoint}/messages/agentMessage`,
+                    message,
+                    {
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    }
+                );
 
-        if (response.status !== 200) {
-            console.error('Server responded with error:', response.data);
-            if (response.data?.error) {
-                console.error('Server error details:', response.data.error);
+                if (response.status === 200) {
+                    return;
+                }
+            } catch (error) {
+                retries++;
+                if (retries === maxRetries) {
+                    throw error;
+                }
+                // Wait before retrying
+                await new Promise(resolve => setTimeout(resolve, 1000 * retries));
             }
         }
 
@@ -256,8 +282,6 @@ export class AgentClient extends DirectClient {
         throw error;
     }
 }
-
-
 
   public getAgentId(): number {
     return this.agentNumericId;
@@ -292,38 +316,23 @@ export class AgentClient extends DirectClient {
 
   private async handleAgentMessage(message: any): Promise<void> {
     try {
-      // Log incoming message for debugging
-      console.log('Received agent message:', JSON.stringify(message, null, 2));
-      
-      // Ensure message has the required structure before validation
-      const formattedMessage = {
-        messageType: WsMessageTypes.AGENT_MESSAGE,
-        signature: message.signature || '',
-        sender: message.sender || '',
-        content: {
-          agentId: message.content?.agentId || 0,
-          text: message.content?.text || '',
-          // Add required fields from schema
-          timestamp: Date.now(),
-          roomId: this.roomId,
-          roundId: this.roundId
-        }
-      };
-
-      // Validate with schema
-      const validatedMessage = agentMessageInputSchema.parse(formattedMessage);
+      // Add message ID tracking to prevent duplicate processing
+      const messageId = `${message.content?.timestamp}-${message.content?.agentId}`;
+      if (this.processedMessages.has(messageId)) {
+        console.log('Skipping duplicate message:', messageId);
+        return;
+      }
+      this.processedMessages.add(messageId);
 
       // Only respond to messages from other agents
-      if (validatedMessage.content.agentId !== this.agentNumericId) {
-        const response = await this.processMessage(validatedMessage.content.text);
+      if (message.content?.agentId !== this.agentNumericId) {
+        const response = await this.integration.processMessage(message.content?.text);
         if (response) {
           await this.sendAIMessage({ text: response });
         }
       }
     } catch (error) {
       console.error('Error handling agent message:', error);
-      // Log the original message for debugging
-      console.error('Original message:', message);
     }
   }
 
@@ -345,16 +354,34 @@ export class AgentClient extends DirectClient {
   }
 
   protected async processMessage(message: string): Promise<string | null> {
+    if (!message) return null;
+    
     try {
-      // Handle raw string messages from GM
-      if (typeof message === 'string' && !message.startsWith('{')) {
-        const prompt = this.buildPromptWithContext(message);
-        
-        // For now returning the message as-is
-        return message;
-      }
+      // Use integration's processMessage which uses runtime's text generation
+      return await this.integration.processMessage(message);
+    } catch (error) {
+      console.error('Error processing message:', error);
+      return null;
+    }
+  }
 
-      // Handle JSON messages
+  private async processAIMessage(message: string): Promise<string | null> {
+    try {
+      // Delegate ALL AI processing to integration, including prompt building
+      const response = await this.integration.processMessage(message);
+      if (!response) {
+        console.error('Failed to get AI response');
+        return null;
+      }
+      return response;
+    } catch (error) {
+      console.error('Error generating AI response:', error);
+      return null;
+    }
+  }
+
+  private async processSystemMessage(message: string): Promise<string | null> {
+    try {
       const parsedMessage = JSON.parse(message);
       
       // First check if message should be processed based on PvP status
@@ -365,55 +392,8 @@ export class AgentClient extends DirectClient {
       // Apply any PvP modifications
       const modifiedMessage = this.applyPvPEffects(parsedMessage);
 
-      // Update context based on message type
+      // Handle different message types without LLM
       switch (modifiedMessage.messageType) {
-        case WsMessageTypes.GM_MESSAGE:
-          if (this.messageContext.length >= this.MAX_CONTEXT_SIZE) {
-            this.messageContext.shift();
-          }
-          this.messageContext.push({
-            timestamp: Date.now(),
-            agentId: 51, // GM ID
-            text: modifiedMessage.content.message,
-            agentName: 'Game Master',
-            role: 'gm'
-          });
-          const gmPrompt = this.buildPromptWithContext(modifiedMessage.content.message);
-          return gmPrompt;
-
-        case WsMessageTypes.AGENT_MESSAGE:
-          if (modifiedMessage.content.agentId !== this.agentNumericId) {
-            if (this.messageContext.length >= this.MAX_CONTEXT_SIZE) {
-              this.messageContext.shift();
-            }
-            this.messageContext.push({
-              timestamp: Date.now(),
-              agentId: modifiedMessage.content.agentId,
-              text: modifiedMessage.content.text,
-              agentName: `Agent ${modifiedMessage.content.agentId}`,
-              role: 'agent'
-            });
-            const agentPrompt = this.buildPromptWithContext(modifiedMessage.content.text);
-            return agentPrompt;
-          }
-          return null;
-
-        case WsMessageTypes.OBSERVATION:
-          if (this.messageContext.length >= this.MAX_CONTEXT_SIZE) {
-            this.messageContext.shift();
-          }
-          this.messageContext.push({
-            timestamp: Date.now(),
-            agentId: modifiedMessage.content.agentId,
-            text: `Observation: ${JSON.stringify(modifiedMessage.content.data)}`,
-            agentName: 'Oracle',
-            role: 'oracle'
-          });
-          const obsPrompt = this.buildPromptWithContext(
-            `Observation: ${JSON.stringify(modifiedMessage.content.data)}`
-          );
-          return obsPrompt;
-
         case WsMessageTypes.HEARTBEAT:
           return JSON.stringify({
             messageType: WsMessageTypes.HEARTBEAT,
@@ -424,34 +404,57 @@ export class AgentClient extends DirectClient {
           console.log('System notification:', modifiedMessage.content);
           return null;
 
+        // For dialogue-based messages, update context and process with AI
+        case WsMessageTypes.GM_MESSAGE:
+          this.updateMessageContext({
+            timestamp: Date.now(),
+            agentId: 51, // GM ID
+            text: modifiedMessage.content.message,
+            agentName: 'Game Master',
+            role: 'gm'
+          });
+          return this.processAIMessage(modifiedMessage.content.message);
+
+        case WsMessageTypes.AGENT_MESSAGE:
+          if (modifiedMessage.content.agentId !== this.agentNumericId) {
+            this.updateMessageContext({
+              timestamp: Date.now(),
+              agentId: modifiedMessage.content.agentId,
+              text: modifiedMessage.content.text,
+              agentName: `Agent ${modifiedMessage.content.agentId}`,
+              role: 'agent'
+            });
+            return this.processAIMessage(modifiedMessage.content.text);
+          }
+          return null;
+
+        case WsMessageTypes.OBSERVATION:
+          this.updateMessageContext({
+            timestamp: Date.now(),
+            agentId: modifiedMessage.content.agentId,
+            text: `Observation: ${JSON.stringify(modifiedMessage.content.data)}`,
+            agentName: 'Oracle',
+            role: 'oracle'
+          });
+          return this.processAIMessage(
+            `Observation: ${JSON.stringify(modifiedMessage.content.data)}`
+          );
+
         default:
           console.log('Unknown message type:', modifiedMessage.messageType);
           return null;
       }
     } catch (error) {
-      console.error('Error processing message:', error);
+      console.error('Error processing system message:', error);
       return null;
     }
   }
 
-  private buildPromptWithContext(text: string): string {
-    let prompt = `You are participating in a crypto debate. Your message should be a direct response to the conversation context below.
-
-Previous messages:
-${this.messageContext.map(msg => 
-  `${msg.agentName} (${msg.role}): ${msg.text}`
-).join('\n')}
-
-Based on this context, respond with your perspective on the discussion. Remember to:
-1. Reference specific points made by others
-2. Stay in character as your assigned chain advocate
-3. Keep responses clear and focused
-4. Support your arguments with technical merits
-5. Maintain a professional but passionate tone
-
-Your response to the current topic: ${text}
-`;
-    return prompt;
+  private updateMessageContext(entry: MessageHistoryEntry): void {
+    if (this.messageContext.length >= this.MAX_CONTEXT_SIZE) {
+      this.messageContext.shift();
+    }
+    this.messageContext.push(entry);
   }
 
   private isAffectedByPvP(message: any): boolean {
@@ -502,6 +505,22 @@ Your response to the current topic: ${text}
     try {
       const message = JSON.parse(data.toString());
       
+      // Add heartbeat handling immediately when message received
+      if (message.messageType === WsMessageTypes.HEARTBEAT) {
+          const heartbeatContent = createMessageContent.heartbeat(); // Remove arguments
+          
+          const signature = await signMessage(heartbeatContent, this.wallet.privateKey);
+          
+          this.wsClient?.send({
+              messageType: WsMessageTypes.HEARTBEAT,
+              content: heartbeatContent,
+              signature,
+              sender: this.walletAddress,
+              timestamp: Date.now() // Add timestamp to message metadata only
+          });
+          return;
+      }
+
       switch (message.messageType) {
         case WsMessageTypes.GM_MESSAGE:
           // Process GM message and generate response
